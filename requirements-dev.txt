@@ -1,0 +1,4 @@
+pyglet>=1.4.8
+ratcave>=0.8.0
+pyInstaller>=3.5
+auto-py-to-exe>=2.6.6

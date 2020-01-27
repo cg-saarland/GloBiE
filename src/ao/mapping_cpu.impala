@@ -1,0 +1,50 @@
+
+type OutFn = fn(i32, i32, Vec3, Scalar) -> ();
+
+fn @iterate_tris(
+	math: Intrinsics, out: Buffer, width: i32, height: i32,
+	num_tris: i32, tris: fn(ScalarIntrinsics, i32)->Triangle,
+    body: fn(ScalarIntrinsics, Triangle, OutFn) -> ()
+) -> () {
+    random_seed(get_micro_time() as u32);
+
+    //for benchmark_cpu() {
+        for t in outer_loop(0, num_tris) {
+            let mut state = random_val_u64();
+            fn rand() -> Scalar {
+                let (r, s) = rnd_f64(state);
+                state = s;
+                r as Scalar
+                //scalar(0.)
+            }
+
+            let math = ScalarIntrinsics {
+                sqrt: sqrt(math),
+                fabs: fabs(math),
+                rand: rand,
+                sin: sin(math),
+                cos: cos(math),
+            };
+
+            fn clamp(f: Scalar) -> u8 {
+                let mut i = (f*scalar(255.5)) as i32;
+
+                if i < 0   { i = 0; }
+                if i > 255 { i = 255; }
+
+                i as u8
+            }
+
+            fn out_fun(x: i32, y: i32, result: Vec3, alpha: Scalar) -> () {
+                let out = bitcast[&mut[u8]](out.data);
+				let idx = 4 * (y * width + x);
+                out(idx  ) = clamp(result.x);
+                out(idx+1) = clamp(result.y);
+                out(idx+2) = clamp(result.z);
+                out(idx+3) = clamp(alpha);
+            }
+
+            @@body(math, tris(math, t), out_fun);
+        }
+    //}
+}

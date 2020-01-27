@@ -1,0 +1,428 @@
+
+// MWC64X Random Number Generator
+// http://cas.ee.ic.ac.uk/people/dt10/research/rngs-gpu-mwc64x.html
+fn @rnd_u32(state: u64) -> (u32, u64) {
+    let hi = state >> 32u64;
+    let lo = state & 0xFFFFFFFFu64;
+    (lo as u32 ^ hi as u32, lo * 4294883355u64 + hi)
+}
+
+fn @rnd_f64(state: u64) -> (f64, u64) {
+    let (r, state) = rnd_u32(state);
+    let k = 1.0 / 0xFFFFFFFFu64 as f64;
+    (r as f64 * k, state)
+}
+
+static NAO_SAMPLES = 16;
+static PI          = 3.14159265358979323846 as Scalar;
+static epsilon     = 1.0e-17 as Scalar;
+
+static has_avx2    = true;
+
+type Scalar = f32;
+fn @sqrt(math: Intrinsics) -> MathFn1 { math.sqrtf }
+fn @fabs(math: Intrinsics) -> MathFn1 { math.fabsf }
+fn @cos (math: Intrinsics) -> MathFn1 { math.cosf  }
+fn @sin (math: Intrinsics) -> MathFn1 { math.sinf  }
+
+type MathFn0 = fn() -> Scalar;
+type MathFn1 = fn(Scalar) -> Scalar;
+type MathFn2 = fn(Scalar,Scalar) -> Scalar;
+type MathFn3 = fn(Scalar,Scalar,Scalar) -> Scalar;
+
+struct ScalarIntrinsics {
+    sqrt: MathFn1,
+    rand: MathFn0,
+    fabs: MathFn1,
+    sin: MathFn1,
+    cos: MathFn1,
+}
+
+fn @scalar(f: f64) -> Scalar { f as Scalar }
+fn @scalar_f32(f: f32) -> Scalar { f as Scalar }
+fn @scalar_i32(i: i32) -> Scalar { i as Scalar }
+fn @make_Scalar(ptr: &[f32], offset: i32) -> Scalar { ptr(offset) as Scalar }
+
+fn @ortho_basis(math: ScalarIntrinsics, n: Vec3) -> [Vec3 * 3] {
+    let mut basis: [Vec3 * 3];
+    let mut x = scalar(0.0); let mut y = scalar(0.0); let mut z = scalar(0.0);
+
+    if n.x < scalar(0.6) && n.x > scalar(-0.6) {
+        x = scalar(1.0);
+    } else if n.y < scalar(0.6) && n.y > scalar(-0.6) {
+        y = scalar(1.0);
+    } else if n.z < scalar(0.6) && n.z > scalar(-0.6) {
+        z = scalar(1.0);
+    } else {
+        x = scalar(1.0);
+    }
+
+    basis(1).x = x; basis(1).y = y; basis(1).z = z;
+    basis(2) = n;
+    basis(0) = vec3_normalize(math, vec3_cross(basis(1), basis(2)));
+    basis(1) = vec3_normalize(math, vec3_cross(basis(2), basis(0)));
+
+    basis
+}
+
+struct Triangle {
+	v0: Vec3, v1: Vec3, v2: Vec3,
+	n0: Vec3, n1: Vec3, n2: Vec3,
+	t0: Vec2, t1: Vec2, t2: Vec2,
+}
+
+struct World {
+	intersect: fn(ScalarIntrinsics, Ray) -> Hit,
+}
+
+fn @ambient_occlusion(math: ScalarIntrinsics, point: Vec3, normal: Vec3, world: World) -> Scalar {
+    let ntheta  = NAO_SAMPLES;
+    let nphi    = NAO_SAMPLES;
+	let tmin    = scalar(0.0001);
+	let tmax    = scalar(0.45);
+
+    //let p = vec3_add(point, vec3_mulf(normal, epsilon));
+    let basis = ortho_basis(math, normal);
+
+    let mut color = scalar(0.0);
+    for j in range(0, ntheta) {
+        for i in range(0, nphi) {
+            let theta = math.sqrt(math.rand());
+            let phi   = scalar(2.0) * PI * math.rand();
+
+            let x = math.cos(phi) * theta;
+            let y = math.sin(phi) * theta;
+            let z = math.sqrt(scalar(1.0) - theta * theta);
+
+            // local -> global
+            let rx = x * basis(0).x + y * basis(1).x + z * basis(2).x;
+            let ry = x * basis(0).y + y * basis(1).y + z * basis(2).y;
+            let rz = x * basis(0).z + y * basis(1).z + z * basis(2).z;
+
+            let ray = make_ray(point, make_vec3(rx, ry, rz), tmin, tmax);
+			let occ_isect = world.intersect(math, ray);
+
+            if occ_isect.prim_id == -1 { color += scalar(1.0); }
+        }
+    }
+
+    color / scalar_i32(ntheta * nphi)
+}
+
+
+fn @iround(f: Scalar) -> i32 {
+	f as i32
+}
+
+
+fn processTriangleWireframe(v1: Vec2, v2: Vec2, v3: Vec2, w: i32, h: i32, draw: fn(i32, i32, Vec3, Vec3, Vec3) -> ()) -> ()
+{
+	processLine(v1, v2, w, h, | x, y, t | { draw(x, y, make_vec3(1.f-t,     t,   0.f), make_vec3(0.f, 0.f, 0.f), make_vec3(0.f, 0.f, 0.f)) });
+	processLine(v2, v3, w, h, | x, y, t | { draw(x, y, make_vec3(  0.f, 1.f-t,     t), make_vec3(0.f, 0.f, 0.f), make_vec3(0.f, 0.f, 0.f)) });
+	processLine(v3, v1, w, h, | x, y, t | { draw(x, y, make_vec3(    t,   0.f, 1.f-t), make_vec3(0.f, 0.f, 0.f), make_vec3(0.f, 0.f, 0.f)) });
+}
+
+fn sign(x: i32) -> i32 {
+	if x > 0 {
+		1
+	} else if x < 0 {
+		-1
+	} else {
+		0
+	}
+}
+
+fn range_step_closed_internal(current: int, stop: int, step: int, flag: bool, body: fn(int) -> ()) -> () {
+	if (current <= stop) == flag {
+        body(current);
+        range_step_closed_internal(current+step, stop, step, flag, body)
+    }
+}
+
+fn range_step_closed(start: int, stop: int, step: int, body: fn(int, f32) -> ()) -> () {
+	if step == 0 {
+		body(start, 0.5f);
+	} else {
+		let flag = start <= stop;
+		let r = 1.f / (stop - start) as f32;
+		range_step_closed_internal(start, stop, step, flag, | i | { body(i, r * (i - start) as f32) })
+	}
+}
+
+fn processLine(v0: Vec2, v1: Vec2, w: i32, h: i32, draw: fn(i32, i32, f32) -> ()) -> ()
+{
+	// ignore subpixel precision
+	let x0 = iround(scalar(16.0) * v0.x) >> 4;
+	let y0 = iround(scalar(16.0) * v0.y) >> 4;
+	let x1 = iround(scalar(16.0) * v1.x) >> 4;
+	let y1 = iround(scalar(16.0) * v1.y) >> 4;
+
+	let mut dx = x1 - x0;
+	let mut dy = y1 - y0;
+
+	let sx = sign(dx);
+	dx = abs(dx);
+
+	let sy = sign(dy);
+	dy = abs(dy);
+
+	let ax = 2*dx;
+	let ay = 2*dy;
+
+	fn rast(
+		bs: i32, bt: i32, ds: i32,
+		ss: i32, st: i32,
+		s0: i32, s1: i32, t0: i32,
+		draw: fn(i32, i32, f32) -> ()
+	) -> () {
+		let mut decy = bt - ds;
+		let mut t = t0;
+		for s, x in range_step_closed(s0, s1, ss) {
+
+			draw(s, t, x);
+
+			if decy >= 0 {
+				decy -= bs;
+				t += st;
+			}
+
+			decy += bt;
+		}
+	}
+
+	fn bounded_draw(x: i32, y: i32, t: f32) -> () {
+		if 0 <= x && x < w && 0 <= y && y < h {
+			draw(x, y, t)
+		}
+	}
+
+	if dy <= dx {
+		rast(ax, ay, dx, sx, sy, x0, x1, y0, |x: i32, y: i32, t: f32| -> () { bounded_draw(x, y, t); });
+	} else {
+		rast(ay, ax, dy, sy, sx, y0, y1, x0, |x: i32, y: i32, t: f32| -> () { bounded_draw(y, x, t); });
+	}
+}
+
+
+fn @processTriangle(
+	v1: Vec2, v2: Vec2, v3: Vec2,
+	w: i32, h: i32,
+	draw: fn(i32, i32, Vec3, Vec3, Vec3) -> ()
+) -> () {
+    // 28.4 fixed-point coordinates
+    let Y1 = iround(scalar(16.0) * v1.y);
+    let Y2 = iround(scalar(16.0) * v2.y);
+    let Y3 = iround(scalar(16.0) * v3.y);
+
+    let X1 = iround(scalar(16.0) * v1.x);
+    let X2 = iround(scalar(16.0) * v2.x);
+    let X3 = iround(scalar(16.0) * v3.x);
+
+    // Deltas
+    let DX12 = X1 - X2;
+    let DX23 = X2 - X3;
+    let DX31 = X3 - X1;
+
+    let DY12 = Y1 - Y2;
+    let DY23 = Y2 - Y3;
+    let DY31 = Y3 - Y1;
+
+    // Fixed-point deltas
+    let FDX12 = DX12 << 4;
+    let FDX23 = DX23 << 4;
+    let FDX31 = DX31 << 4;
+
+    let FDY12 = DY12 << 4;
+    let FDY23 = DY23 << 4;
+    let FDY31 = DY31 << 4;
+
+    // Bounding rectangle
+    let tXmin = (min3_i32(X1, X2, X3) + 0xF) >> 4;
+    let tXmax = (max3_i32(X1, X2, X3) + 0xF) >> 4;
+    let tYmin = (min3_i32(Y1, Y2, Y3) + 0xF) >> 4;
+    let tYmax = (max3_i32(Y1, Y2, Y3) + 0xF) >> 4;
+
+    let Xmin = max_i32(tXmin, 0);
+    let Xmax = min_i32(tXmax, w);
+    let Ymin = max_i32(tYmin, 0);
+    let Ymax = min_i32(tYmax, h);
+
+    // Half-edge constants
+    let mut C12 = DY12 * X1 - DX12 * Y1;
+    let mut C23 = DY23 * X2 - DX23 * Y2;
+    let mut C31 = DY31 * X3 - DX31 * Y3;
+
+    // Correct for fill convention
+    if DY12 < 0 || (DY12 == 0 && DX12 > 0) { C12++; }
+    if DY23 < 0 || (DY23 == 0 && DX23 > 0) { C23++; }
+    if DY31 < 0 || (DY31 == 0 && DX31 > 0) { C31++; }
+
+    let CY12 = C12 + DX12 * (Ymin << 4) - DY12 * (Xmin << 4);
+    let CY23 = C23 + DX23 * (Ymin << 4) - DY23 * (Xmin << 4);
+    let CY31 = C31 + DX31 * (Ymin << 4) - DY31 * (Xmin << 4);
+
+    let denominator = scalar_i32(DX23*DY31 - DY23*DX31);
+
+    let Yrange = Ymax-Ymin;
+    let Xrange = Xmax-Xmin;
+
+    for Yi in range(0, Yrange) {
+        for Xi in range(0, Xrange) {
+            let Y = Ymin + Yi;
+            let X = Xmin + Xi;
+
+            let E12 = CY12 + FDX12*Yi - FDY12*Xi;
+            let E23 = CY23 + FDX23*Yi - FDY23*Xi;
+            let E31 = CY31 + FDX31*Yi - FDY31*Xi;
+
+            if E12 > 0 && E23 > 0 && E31 > 0 {
+                // calculate barycentric coordinates
+                let Xo = (X<<4) - X3;
+                let Yo = (Y<<4) - Y3;
+
+				let invDenominator = scalar(1.0) / denominator;
+                let t1 = invDenominator * scalar_i32( DY23*Xo - DX23*Yo );
+                let t2 = invDenominator * scalar_i32( DY31*Xo - DX31*Yo );
+                let t3 = scalar(1.0) - t1 - t2;
+
+                // perspective correct interpolate varying
+                @@draw(
+                    X, Y,
+                    make_vec3(t1, t2, t3), // b.coords
+                    /* vec3_mulf(make_vec3( // d(b.coords)/dx
+						scalar_i32(FDY23),
+						scalar_i32(FDY31),
+						scalar_i32(-FDY23 - FDY31)
+					), invDenominator) */ make_vec3(0.f, 0.f, 0.f),
+                    /* vec3_mulf(make_vec3( // d(b.coords)/dy
+                        scalar_i32(-FDX23),
+                        scalar_i32(-FDX31),
+                        scalar_i32(FDX23 + FDX31)
+                    ), invDenominator) */ make_vec3(0.f, 0.f, 0.f)
+                );
+            }
+        }
+    }
+}
+
+fn min3_i32(a: i32, b: i32, c: i32) -> i32 {
+    let mut m = a;
+    if m > b { m = b; }
+    if m > c { m = c; }
+    m
+}
+
+fn max3_i32(a: i32, b: i32, c: i32) -> i32 {
+    let mut m = a;
+    if m < b { m = b; }
+    if m < c { m = c; }
+    m
+}
+
+fn min_i32(a: i32, b: i32) -> i32 {
+    if a < b { a } else { b }
+}
+
+fn max_i32(a: i32, b: i32) -> i32 {
+    if a < b { b } else { a }
+}
+
+fn render(img: Buffer, w: i32, h: i32, num_tris: i32, tris: fn(ScalarIntrinsics, i32)->Triangle, world: World) -> () {
+
+	for math, tri, out in iterate_tris(math, img, w, h, num_tris, tris) {
+		let vp = make_vec2(scalar_i32(w), scalar_i32(h));
+
+		let v0 = vec2_mul(vp, make_vec2(tri.t0.x, scalar(1.0) - tri.t0.y));
+		let v1 = vec2_mul(vp, make_vec2(tri.t1.x, scalar(1.0) - tri.t1.y));
+		let v2 = vec2_mul(vp, make_vec2(tri.t2.x, scalar(1.0) - tri.t2.y));
+
+		let draw = | x: i32, y: i32, bc: Vec3, dx: Vec3, dy: Vec3 | -> () {
+			let point = make_vec3(
+				vec3_dot(bc, make_vec3(tri.v0.x, tri.v1.x, tri.v2.x)),
+				vec3_dot(bc, make_vec3(tri.v0.y, tri.v1.y, tri.v2.y)),
+				vec3_dot(bc, make_vec3(tri.v0.z, tri.v1.z, tri.v2.z)),
+			);
+			let normal = make_vec3(
+				vec3_dot(bc, make_vec3(tri.n0.x, tri.n1.x, tri.n2.x)),
+				vec3_dot(bc, make_vec3(tri.n0.y, tri.n1.y, tri.n2.y)),
+				vec3_dot(bc, make_vec3(tri.n0.z, tri.n1.z, tri.n2.z)),
+			);
+			let mut value = ambient_occlusion(math, point, normal, world);
+
+			//if bc.x < scalar(0.01) || bc.y < scalar(0.01) || bc.z < scalar(0.01) {
+			//	value = scalar(0.7);
+			//}
+
+			out(x, y, make_vec3(value, value, value), scalar(1.0));
+			//out(x, y, vec3_mulf(point, 1.0f), scalar(1.0));
+			//out(x, y, normal, scalar(1.0));
+		};
+
+		processTriangle(v0, v1, v2, w, h, draw);
+		processTriangle(v2, v1, v0, w, h, | x, y, bc, dx, dy | draw(x, y, make_vec3(bc.z, bc.y, bc.x), dx, dy) );
+		//processTriangleWireframe(v0, v1, v2, w, h, draw);
+	}
+}
+
+fn @Vec2Array(size: i32, ptr: &[f32]) -> (fn(i32)->Vec2) {
+	let stride = 2;
+	| i: i32 | Vec2 { x : make_Scalar(ptr, stride*i), y : make_Scalar(ptr, stride*i+1) }
+}
+
+fn @Vec3Array(size: i32, ptr: &[f32]) -> (fn(i32)->Vec3) {
+	let stride = 3;
+	| i: i32 | Vec3 { x : make_Scalar(ptr, stride*i), y : make_Scalar(ptr, stride*i+1), z : make_Scalar(ptr, stride*i+2) }
+}
+
+extern
+fn aomap(
+	width: i32, height: i32, ptr: &mut [i8],
+	num_vertices: i32, vptr: &[f32],
+	num_normals: i32, nptr: &[f32],
+	num_texcoord: i32, tptr: &[f32],
+    nodes: &[Node8], tris: &[Tri4]
+) -> () {
+    let img = Buffer { device: 0, data: ptr, size: (width*height*4) as i64 };
+
+	let vertex = Vec3Array(num_vertices, vptr);
+	let normal = Vec3Array(num_normals, nptr);
+	let texcoord = Vec2Array(num_texcoord, tptr);
+
+	// num_texcoord <= num_vertices
+	// the scene may contain more triangles (for intersection) than equipped with global uv coords
+	// TODO: safe texcoord access
+	let num_tris_isect = num_vertices;
+	let num_tris_draw = num_texcoord;
+	let tris2 = | math: ScalarIntrinsics, t: i32 | {
+		let o = 3*t;
+		let (v0, v1, v2) = (vertex(o), vertex(o+1), vertex(o+2));
+
+		let n = @| i | -> Vec3 {
+			if (num_normals > 0) {
+				normal(o+i)
+			} else {
+				let e1 = vec3_sub(v1, v0);
+				let e2 = vec3_sub(v2, v0);
+
+				vec3_normalize(math, vec3_cross(e1, e2))
+			}
+		};
+
+		Triangle {
+			v0: v0, v1: v1, v2: v2,
+			n0: n(0), n1: n(1), n2: n(2),
+			t0: texcoord(o), t1: texcoord(o+1), t2: texcoord(o+2),
+		}
+	};
+
+    let bvh = make_cpu_bvh8_tri4(nodes, tris);
+    let min_max = if has_avx2 { make_cpu_int_min_max() } else { make_default_min_max() };
+
+	let world = World {
+		intersect: | math, ray | -> Hit {
+            cpu_traverse_single_helper(ray, ray_octant(ray), min_max, bvh, true, 1)
+		}
+	};
+
+    render(img, width, height, num_tris_draw, tris2, world);
+}

@@ -1,0 +1,10 @@
+/cache
+__pycache__
+build*
+
+testClient/node_modules/
+out/
+output/
+
+/.vscode
+tmpFiles/
